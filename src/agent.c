@@ -396,6 +396,202 @@ struct agent_ops agent_ops_pageant = {
     agent_transact_pageant,
     agent_disconnect_pageant
 };
+
+static int w32_pipe_connect(HANDLE* h, const char *path, DWORD flags)
+{
+    while(1) {
+        *h = CreateFileA(path, GENERIC_READ | GENERIC_WRITE, 0, NULL,
+            OPEN_EXISTING, flags, NULL);
+
+        if(h != INVALID_HANDLE_VALUE)
+            break;
+
+        if(GetLastError() != ERROR_PIPE_BUSY)
+            return 1;
+
+        if(!WaitNamedPipeA(path, 500))
+            return 1;
+    }
+
+    return 0;
+}
+
+static int agent_connect_win(LIBSSH2_AGENT *agent)
+{
+    HANDLE h = INVALID_HANDLE_VALUE;
+    const char *path;
+
+    agent->fd = (SOCKET)h;
+
+    path = agent->identity_agent_path;
+    if(!path) {
+        if(getenv("SSH_AUTH_SOCK") == NULL)
+            _putenv("SSH_AUTH_SOCK=\\\\.\\pipe\\openssh-ssh-agent");
+
+        path = getenv("SSH_AUTH_SOCK");
+        if(!path) {
+            return _libssh2_error(agent->session, LIBSSH2_ERROR_BAD_USE,
+                                  "no auth sock variable");
+        }
+    }
+
+    DWORD flags = SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION;
+    if(w32_pipe_connect(&h, path, flags)) {
+        return _libssh2_error(agent->session, LIBSSH2_ERROR_AGENT_PROTOCOL,
+                              "failed connecting with agent");
+    }
+
+    /* set pipe read mode */
+    DWORD pipe_mode = PIPE_READMODE_BYTE;
+    if(!SetNamedPipeHandleState(h, &pipe_mode, NULL, NULL)) {
+        return _libssh2_error(agent->session,
+                              LIBSSH2_ERROR_AGENT_PROTOCOL,
+                              "failed setting pipe read mode");
+    }
+
+    /* fd is SOCKET which is typedef to uintptr on win, so following
+     * should be fine */
+    agent->fd = (SOCKET)h;
+    return LIBSSH2_ERROR_NONE;
+}
+
+static LIBSSH2_SEND_FUNC(w32_write)
+{
+    HANDLE h = (HANDLE)socket;
+
+    DWORD bytes_written = 0;
+    if(WriteFile((HANDLE)socket, buffer, length, &bytes_written, NULL))
+        return bytes_written;
+
+    return -EIO;
+}
+
+static LIBSSH2_SEND_FUNC(w32_read)
+{
+    HANDLE h = (HANDLE)socket;
+
+    DWORD bytes_read = 0;
+    if(ReadFile(h, buffer, length, &bytes_read, NULL))
+        return bytes_read;
+
+    return -EIO;
+}
+
+#define RECV_SEND_ALL(func, socket, buffer, length, flags, abstract) \
+    int rc;                                                          \
+    size_t finished = 0;                                             \
+                                                                     \
+    while(finished < length) {                                       \
+        rc = func(socket,                                            \
+                  (char *)buffer + finished, length - finished,      \
+                  flags, abstract);                                  \
+        if(rc < 0)                                                   \
+            return rc;                                               \
+                                                                     \
+        finished += rc;                                              \
+    }                                                                \
+                                                                     \
+    return finished;
+
+static ssize_t _send_all(LIBSSH2_SEND_FUNC(func), libssh2_socket_t socket,
+                         const void *buffer, size_t length,
+                         int flags, void **abstract)
+{
+    RECV_SEND_ALL(func, socket, buffer, length, flags, abstract);
+}
+
+static ssize_t _recv_all(LIBSSH2_RECV_FUNC(func), libssh2_socket_t socket,
+                         void *buffer, size_t length,
+                         int flags, void **abstract)
+{
+    RECV_SEND_ALL(func, socket, buffer, length, flags, abstract);
+}
+
+#undef RECV_SEND_ALL
+
+static int
+agent_transact_win(LIBSSH2_AGENT *agent, agent_transaction_ctx_t transctx)
+{
+    unsigned char buf[4];
+    int rc;
+
+    /* Send the length of the request */
+    if(transctx->state == agent_NB_state_request_created) {
+        _libssh2_htonu32(buf, transctx->request_len);
+        rc = _send_all(w32_write, agent->fd,
+                       buf, sizeof buf, 0, &agent->session->abstract);
+        if(rc == -EAGAIN)
+            return LIBSSH2_ERROR_EAGAIN;
+        else if(rc < 0)
+            return _libssh2_error(agent->session, LIBSSH2_ERROR_SOCKET_SEND,
+                                  "agent send failed");
+        transctx->state = agent_NB_state_request_length_sent;
+    }
+
+    /* Send the request body */
+    if(transctx->state == agent_NB_state_request_length_sent) {
+        rc = _send_all(w32_write, agent->fd, transctx->request,
+                       transctx->request_len, 0, &agent->session->abstract);
+        if(rc == -EAGAIN)
+            return LIBSSH2_ERROR_EAGAIN;
+        else if(rc < 0)
+            return _libssh2_error(agent->session, LIBSSH2_ERROR_SOCKET_SEND,
+                                  "agent send failed");
+        transctx->state = agent_NB_state_request_sent;
+    }
+
+    /* Receive the length of a response */
+    if(transctx->state == agent_NB_state_request_sent) {
+        rc = _recv_all(w32_read, agent->fd,
+                       buf, sizeof buf, 0, &agent->session->abstract);
+        if(rc < 0) {
+            if(rc == -EAGAIN)
+                return LIBSSH2_ERROR_EAGAIN;
+            return _libssh2_error(agent->session, LIBSSH2_ERROR_SOCKET_RECV,
+                                  "agent recv failed");
+        }
+        transctx->response_len = _libssh2_ntohu32(buf);
+        transctx->response = LIBSSH2_ALLOC(agent->session,
+                                           transctx->response_len);
+        if(!transctx->response)
+            return LIBSSH2_ERROR_ALLOC;
+
+        transctx->state = agent_NB_state_response_length_received;
+    }
+
+    /* Receive the response body */
+    if(transctx->state == agent_NB_state_response_length_received) {
+        rc = _recv_all(w32_read, agent->fd, transctx->response,
+                       transctx->response_len, 0, &agent->session->abstract);
+        if(rc < 0) {
+            if(rc == -EAGAIN)
+                return LIBSSH2_ERROR_EAGAIN;
+            return _libssh2_error(agent->session, LIBSSH2_ERROR_SOCKET_SEND,
+                                  "agent recv failed");
+        }
+        transctx->state = agent_NB_state_response_received;
+    }
+
+    return 0;
+}
+
+static int
+agent_disconnect_win(LIBSSH2_AGENT *agent)
+{
+    HANDLE h = (HANDLE)agent->fd;
+    if(INVALID_HANDLE_VALUE == h)
+        return 0;
+
+    CloseHandle(h);
+    agent->fd = (HANDLE)INVALID_HANDLE_VALUE;
+    return 0;
+}
+
+struct agent_ops agent_ops_win = {
+    agent_connect_win,
+    agent_transact_win,
+    agent_disconnect_win
+};
 #endif  /* WIN32 */
 
 static struct {
@@ -404,6 +600,7 @@ static struct {
 } supported_backends[] = {
 #ifdef WIN32
     {"Pageant", &agent_ops_pageant},
+    {"Windows-pipe", &agent_ops_win},
 #endif  /* WIN32 */
 #ifdef PF_UNIX
     {"Unix", &agent_ops_unix},
