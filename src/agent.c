@@ -466,7 +466,7 @@ static LIBSSH2_SEND_FUNC(w32_write)
     return -EIO;
 }
 
-static LIBSSH2_SEND_FUNC(w32_read)
+static LIBSSH2_RECV_FUNC(w32_read)
 {
     HANDLE h = (HANDLE)socket;
 
